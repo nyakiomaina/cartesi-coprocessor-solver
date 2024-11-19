@@ -51,6 +51,7 @@ const TASK_INDEX: u32 = 1;
 struct Config {
     http_endpoint: String,
     ws_endpoint: String,
+    l2_coprocessor_address: Address,
     registry_coordinator_address: Address,
     operator_state_retriever_address: Address,
     current_first_block: u64,
@@ -107,7 +108,7 @@ async fn main() {
     client
         .batch_execute(
             "
-        CREATE UNIQUE INDEX IF NOT EXISTS unique_machine_input_callback 
+        CREATE UNIQUE INDEX IF NOT EXISTS unique_machine_input_callback
         ON issued_tasks ((machineHash || input || callback))
 ",
         )
@@ -963,6 +964,7 @@ fn subscribe_task_issued(
     http_endpoint: String,
     payment_token: Address,
     task_issuer: Address,
+    l2_coprocessor_address: Address,
     pool: Pool<PostgresConnectionManager<NoTls>>,
     secret_key: String,
     payment_phrase: String
@@ -976,8 +978,8 @@ fn subscribe_task_issued(
                 .on_ws(ws_connect)
                 .await
                 .unwrap();
-            let event_filter = Filter::new().address(task_issuer);
-            let event: Event<_, _, ICoprocessor::TaskIssued, _> =
+            let event_filter = Filter::new().address(l2_coprocessor_address);
+            let event: Event<_, _, IL2Coprocessor::TaskIssued, _> =
                 Event::new(ws_provider.clone(), event_filter);
 
             let subscription = event.subscribe().await.unwrap();
@@ -1028,6 +1030,34 @@ fn subscribe_task_issued(
                     Err(_) => {
                     }
                 };
+            }
+        }
+    });
+}
+
+fn subscribe_task_completed(
+    ws_endpoint: String,
+    l2_coprocessor_address: Address,
+    pool: Pool<PostgresConnectionManager<NoTls>>,
+) {
+    task::spawn({
+        async move {
+            println!("Started TaskCompleted subscription");
+            let ws_connect = alloy_provider::WsConnect::new(ws_endpoint);
+            let ws_provider = alloy_provider::ProviderBuilder::new()
+                .on_ws(ws_connect)
+                .await
+                .unwrap();
+
+            let event_filter = Filter::new().address(l2_coprocessor_address);
+            let event: Event<_, _, IL2Coprocessor::TaskCompleted, _> =
+                Event::new(ws_provider.clone(), event_filter);
+
+            let subscription = event.subscribe().await.unwrap();
+            let mut stream = subscription.into_stream();
+
+            while let Some(Ok((task_completed_event, _))) = stream.next().await {
+                println!("TaskCompleted event: {:?}", task_completed_event);
             }
         }
     });
@@ -1235,3 +1265,29 @@ sol! {
         );
     }
 }
+
+sol!(
+    interface IL2Coprocessor {
+        #[derive(Debug)]
+        event TaskIssued(bytes32 machineHash, bytes input, address callback);
+        #[derive(Debug)]
+        event TaskCompleted(bytes32 indexed machineHash, bytes32 responseHash);
+
+        function issueTask(bytes32 machineHash, bytes calldata input, address callback) external;
+        function storeResponseHash(bytes32 responseHash) external;
+        function callbackWithOutputs(
+            Response calldata resp,
+            bytes[] calldata outputs,
+            address callbackAddress
+        ) external;
+    }
+
+    #[derive(Debug, Default)]
+    struct Response {
+        address ruleSet;
+        bytes32 machineHash;
+        bytes32 payloadHash;
+        bytes32 outputMerkle;
+    }
+);
+
