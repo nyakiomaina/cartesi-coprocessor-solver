@@ -44,6 +44,12 @@ mod outputs_merkle;
 use alloy_network::EthereumWallet;
 use futures_util::stream;
 use tokio_postgres::types::{FromSql, ToSql};
+use cartesi_coprocessor_contracts::{
+    l1_coprocessor::{L1Coprocessor, Response as L1Response},
+    l2_coprocessor::{L2Coprocessor, Response as L2Response},
+    icrossdomainmessenger::ICrossDomainMessenger,
+    icoprocessor::ICoprocessorEvents,
+};
 
 const HEIGHT: usize = 63;
 const TASK_INDEX: u32 = 1;
@@ -51,7 +57,6 @@ const TASK_INDEX: u32 = 1;
 struct Config {
     http_endpoint: String,
     ws_endpoint: String,
-    l2_coprocessor_address: Address,
     registry_coordinator_address: Address,
     operator_state_retriever_address: Address,
     current_first_block: u64,
@@ -62,6 +67,13 @@ struct Config {
     payment_phrase: String,
     postgre_connect_request: String,
     payment_token: Address,
+    l2_http_endpoint: String,
+    l2_ws_endpoint: String,
+    l2_coprocessor_address: Address,
+    l1_http_endpoint: String,
+    l1_ws_endpoint: String,
+    l1_coprocessor_address: Address,
+    cross_domain_messenger_address: Address,
 }
 #[derive(Debug, ToSql, FromSql, PartialEq)]
 enum task_status {
@@ -148,6 +160,20 @@ async fn main() {
         alloy_provider::ProviderBuilder::new().on_http(config.http_endpoint.parse().unwrap());
     let current_block_num = provider.get_block_number().await.unwrap();
     println!("current_block_num {:?}", current_block_num);
+
+    let l2_provider = ProviderBuilder::new().on_http(config.l2_http_endpoint.parse().unwrap());
+    let l2_ws_provider = ProviderBuilder::new().on_ws(config.l2_ws_endpoint.parse().unwrap()).await.unwrap();
+
+    let l1_provider = ProviderBuilder::new().on_http(config.l1_http_endpoint.parse().unwrap());
+    let l1_ws_provider = ProviderBuilder::new().on_ws(config.l1_ws_endpoint.parse().unwrap()).await.unwrap();
+
+    let l2_coprocessor_address = Address::parse_checksummed(&config.l2_coprocessor_address, None).unwrap();
+    let l1_coprocessor_address = Address::parse_checksummed(&config.l1_coprocessor_address, None).unwrap();
+    let cross_domain_messenger_address = Address::parse_checksummed(&config.cross_domain_messenger_address, None).unwrap();
+
+    let l2_coprocessor = L2Coprocessor::new(l2_coprocessor_address, &l2_provider);
+    let l1_coprocessor = L1Coprocessor::new(l1_coprocessor_address, &l1_provider);
+    le
 
     task::spawn({
         let arc_operators_info = operators_info_clone.clone();
@@ -501,6 +527,29 @@ async fn main() {
         config.payment_phrase.clone(),
 
     );
+    //Subscriber which handles new tasks received from L2
+    subscribe_task_issued_l2(
+        config.l2_ws_endpoint.clone(),
+        config.l2_coprocessor_address,
+        pool.clone(),
+    );
+
+    //update the handler to process task from l2
+    new_task_issued_handler_l2(
+        config.clone(),
+        l1_coprocessor.clone(),
+        cross_domain_messenger.clone(),
+        pool.clone(),
+    );
+
+    //subscribe to taskcompleted event on l2
+    subscribe_task_completed_l2(
+        config.l2_ws_endpoint.clone(),
+        config.l2_coprocessor_address,
+        pool.clone(),
+        config.clone(),
+    );
+
     //Subscriber which handles new tasks received from DB
     new_task_issued_handler(
         config.ws_endpoint.clone(),
@@ -522,6 +571,52 @@ async fn main() {
         current_last_block.clone(),
     );
     server.await.unwrap();
+}
+
+//fn to subscribe to task issued event on l2
+fn subscribe_task_issued_l2(
+    l2_ws_provider: Provider,
+    l2_coprocessor: L2Coprocessor<Provider>,
+    pool: Pool<PostgresConnectionManager<NoTls>>,
+) {
+    task::spawn(async move {
+        let mut event_stream = l2_coprocessor
+            .event::<TaskIssuedEvent>()
+            .from_block(0)
+            .stream()
+            .await
+            .unwrap();
+
+        while let Some(event) = event_stream.next().await {
+            match event {
+                Ok(task_issued_event) => {
+                    println!("New TaskIssued event on L2: {:?}", task_issued_event);
+
+                    let client = pool.get().await.unwrap();
+                    match client.execute(
+                        "INSERT INTO issued_tasks (machine_hash, input, callback, task_type, status) VALUES ($1, $2, $3, $4, $5::task_status)",
+                        &[
+                            &task_issued_event.machine_hash.0.to_vec(),
+                            &task_issued_event.input.to_vec(),
+                            &task_issued_event.callback.0.to_vec(),
+                            &task_issued_event.task_type,
+                            &TaskStatus::WaitsForHandling,
+                        ],
+                    ).await {
+                        Ok(_) => {
+                            println!("Inserted new task into the database.");
+                        }
+                        Err(err) => {
+                            eprintln!("Error inserting task into database: {:?}", err);
+                        }
+                    };
+                },
+                Err(err) => {
+                    eprintln!("Error receiving TaskIssued event on L2: {:?}", err);
+                }
+            }
+        }
+    });
 }
 
 fn query_operator_socket_update(
@@ -959,6 +1054,160 @@ fn new_task_issued_handler(
     });
 }
 
+async fn process_type_a_task(machine_hash: &[u8], input: &[u8], config: &Config) -> (L2Response, Vec<Vec<u8>>) {
+    let output = input.iter().cloned().rev().collect::<Vec<u8>>();
+    let outputs = vec![output];
+    let response = compute_response(machine_hash, input, config, &outputs);
+    (response, outputs)
+}
+
+async fn process_type_b_task(machine_hash: &[u8], input: &[u8], config: &Config) -> (L2Response, Vec<Vec<u8>>) {
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(input);
+    let output = hasher.finalize().to_vec();
+    let outputs = vec![output];
+    let response = compute_response(machine_hash, input, config, &outputs);
+    (response, outputs)
+}
+
+fn compute_response(machine_hash: &[u8], input: &[u8], config: &Config, outputs: &[Vec<u8>]) -> L2Response {
+    let output_merkle = compute_output_merkle(outputs);
+    L2Response {
+        rule_set: Address::parse_checksummed(&config.ruleset, None).unwrap(),
+        machine_hash: B256::from_slice(machine_hash),
+        payload_hash: keccak256(input),
+        output_merkle,
+    }
+}
+
+fn compute_output_merkle(outputs: &[Vec<u8>]) -> B256 {
+    if outputs.is_empty() {
+        return B256::zero();
+    }
+    let leaves: Vec<B256> = outputs.iter().map(|output| keccak256(output)).collect();
+    merkle_root(&leaves)
+}
+fn merkle_root(leaves: &[B256]) -> B256 {
+    if leaves.len() == 1 {
+        return leaves[0];
+    }
+    let mut next_level = vec![];
+    for i in (0..leaves.len()).step_by(2) {
+        let left = leaves[i];
+        let right = if i + 1 < leaves.len() { leaves[i + 1] } else { leaves[i] };
+        let combined = [left.0.as_ref(), right.0.as_ref()].concat();
+        next_level.push(keccak256(&combined));
+    }
+    merkle_root(&next_level)
+}
+
+fn abi_encode_response(response: &L2Response) -> Vec<u8> {
+    use alloy_sol_types::SolType;
+
+    let response_tuple = (
+        response.rule_set,
+        response.machine_hash,
+        response.payload_hash,
+        response.output_merkle,
+    );
+    let encoded = <(Address, B256, B256, B256) as SolType>::encode(&response_tuple);
+    encoded
+}
+
+async fn store_outputs_for_task(machine_hash: &[u8], outputs: &[Vec<u8>]) {
+    let mut path = PathBuf::from("outputs");
+    fs::create_dir_all(&path).unwrap();
+    path.push(hex::encode(machine_hash));
+
+    let serialized_outputs = serde_json::to_vec(outputs).unwrap();
+    fs::write(path, serialized_outputs).unwrap();
+}
+async fn retrieve_outputs_for_task(machine_hash: &[u8]) -> Vec<Vec<u8>> {
+    let mut path = PathBuf::from("outputs");
+    path.push(hex::encode(machine_hash));
+
+    if let Ok(data) = fs::read(path) {
+        serde_json::from_slice(&data).unwrap()
+    } else {
+        vec![]
+    }
+}
+
+fn subscribe_task_completed_l2(
+    l2_ws_endpoint: String,
+    l2_coprocessor_address: Address,
+    pool: Pool<PostgresConnectionManager<NoTls>>,
+    config: Config,
+) {
+    task::spawn({
+        async move {
+            println!("Started TaskCompleted subscription on L2");
+            let ws_connect = alloy_provider::WsConnect::new(l2_ws_endpoint);
+            let ws_provider = alloy_provider::ProviderBuilder::new()
+                .on_ws(ws_connect)
+                .await
+                .unwrap();
+
+            let event_filter = Filter::new()
+                .address(l2_coprocessor_address)
+                .event("TaskCompleted(bytes32)");
+
+            let event: Event<_, _, L2CoprocessorEvents::TaskCompleted, _> =
+                Event::new(ws_provider.clone(), event_filter);
+
+            let subscription = event.subscribe().await.unwrap();
+            let mut stream = subscription.into_stream();
+
+            while let Ok((stream_event, _)) = stream.next().await.unwrap() {
+                println!("TaskCompleted event on L2: {:?}", stream_event);
+                handle_task_completed_l2(stream_event, &pool, &config).await;
+            }
+        }
+    });
+}
+
+async fn handle_task_completed_l2(
+    task_completed_event: L2CoprocessorEvents::TaskCompleted,
+    pool: &Pool<PostgresConnectionManager<NoTls>>,
+    config: &Config,
+) {
+    let client = pool.get().await.unwrap();
+    let rows = client
+        .query(
+            "SELECT machineHash, input, callback FROM issued_tasks WHERE responseHash = $1",
+            &[&task_completed_event.responseHash.0.to_vec()],
+        )
+        .await
+        .unwrap();
+
+    if !rows.is_empty() {
+        let machine_hash: Vec<u8> = rows[0].get(0);
+        let input: Vec<u8> = rows[0].get(1);
+        let callback: Vec<u8> = rows[0].get(2);
+
+        let response = ResponseSol {
+            ruleSet: Address::parse_checksummed(&config.ruleset, None).unwrap(),
+            machineHash: B256::from_slice(&machine_hash),
+            payloadHash: keccak256(&input),
+            outputMerkle: compute_output_merkle(&input),
+        };
+
+        let outputs: Vec<alloy_primitives::Bytes> = retrieve_outputs_for_task(&machine_hash).await;
+
+        let l2_provider = ProviderBuilder::new()
+            .on_http(config.l2_http_endpoint.parse().unwrap());
+        let l2_coprocessor = L2Coprocessor::new(config.l2_coprocessor_address, &l2_provider);
+
+        l2_coprocessor
+            .callbackWithOutputs(response, outputs, Address::from_slice(&callback))
+            .send()
+            .await
+            .unwrap();
+
+        println!("Successfully called callbackWithOutputs on L2");
+    }
+}
 fn subscribe_task_issued(
     ws_endpoint: String,
     http_endpoint: String,
@@ -1050,7 +1299,7 @@ fn subscribe_task_completed(
                 .unwrap();
 
             let event_filter = Filter::new().address(l2_coprocessor_address);
-            let event: Event<_, _, IL2Coprocessor::TaskCompleted, _> =
+            let event: Event<_, _, L2Coprocessor::TaskCompleted, _> =
                 Event::new(ws_provider.clone(), event_filter);
 
             let subscription = event.subscribe().await.unwrap();
@@ -1058,9 +1307,73 @@ fn subscribe_task_completed(
 
             while let Some(Ok((task_completed_event, _))) = stream.next().await {
                 println!("TaskCompleted event: {:?}", task_completed_event);
+
+                //handle task completion
+                handle_task_completed(
+                    task_completed_event,
+                    &pool,
+                    &config
+                )
+                .await;
             }
         }
     });
+}
+
+async fn handle_task_completed(
+    task_completed_event: L2Coprocessor::TaskCompleted,
+    pool: &Pool<PostgresConnectionManager<NoTls>>,
+    config: &Config,
+) {
+    let client = pool.get().await.unwrap();
+
+    // Retrieve task information from the database
+    let rows = client
+        .query(
+            "SELECT machine_hash, input, callback FROM issued_tasks WHERE response_hash = $1",
+            &[&task_completed_event.response_hash.0.to_vec()],
+        )
+        .await
+        .unwrap();
+
+    if !rows.is_empty() {
+        let machine_hash: Vec<u8> = rows[0].get(0);
+        let input: Vec<u8> = rows[0].get(1);
+        let callback: Vec<u8> = rows[0].get(2);
+
+        // Prepare the response
+        let response = L2Response {
+            rule_set: Address::parse_checksummed(&config.ruleset, None).unwrap(),
+            machine_hash: B256::from_slice(&machine_hash),
+            payload_hash: keccak256(&input),
+            output_merkle: compute_output_merkle(&input),
+        };
+
+        // Retrieve outputs from processing
+        let outputs: Vec<Vec<u8>> = get_outputs_for_task(&machine_hash).await;
+
+        // Create an instance of the L2 Coprocessor contract
+        let l2_provider = ProviderBuilder::new().on_http(config.l2_http_endpoint.parse().unwrap());
+        let l2_coprocessor = L2Coprocessor::new(config.l2_coprocessor_address, &l2_provider);
+
+        // Call callbackWithOutputs on L2 Coprocessor
+        match l2_coprocessor
+            .callback_with_outputs(
+                response,
+                outputs,
+                Address::from_slice(&callback),
+            )
+            .send()
+            .await
+        {
+            Ok(_) => {
+                println!("Successfully called callbackWithOutputs");
+            }
+            Err(err) => {
+                eprintln!("Error calling callbackWithOutputs: {:?}", err);
+            }
+        }
+    }
 }
 
 fn subscribe_operator_socket_update(
