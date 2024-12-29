@@ -62,6 +62,7 @@ struct Config {
     current_first_block: u64,
     task_issuer: Address,
     ruleset: String,
+    max_ops: u64,
     socket: String,
     secret_key: String,
     payment_phrase: String,
@@ -197,6 +198,7 @@ async fn main() {
     );
 
     let ruleset = config.ruleset.clone();
+    let max_ops = config.max_ops.clone();
     let addr: SocketAddr = ([0, 0, 0, 0], 3034).into();
     let service = make_service_fn(|_| {
         let avs_registry_service = avs_registry_service.clone();
@@ -299,6 +301,7 @@ async fn main() {
                                         avs_registry_service.clone(),
                                         time_to_expiry,
                                         ruleset.clone(),
+                                        max_ops,
                                         current_block_num,
                                         quorum_nums.to_vec(),
                                         quorum_threshold_percentages.clone(),
@@ -558,6 +561,7 @@ async fn main() {
         sockets_map.clone(),
         config.socket.clone(),
         config.ruleset,
+        config.max_ops,
         current_block_num,
         config.secret_key.clone(),
         config.task_issuer,
@@ -689,6 +693,7 @@ async fn handle_task_issued_operator(
     >,
     time_to_expiry: Duration,
     ruleset: String,
+    max_ops: u64,
     current_block_num: u64,
     quorum_nums: Vec<u8>,
     quorum_threshold_percentages: Vec<u8>,
@@ -714,6 +719,7 @@ async fn handle_task_issued_operator(
                 let request = Request::builder()
                     .method("POST")
                     .header("X-Ruleset", &ruleset)
+                    .header("X-Max-Ops", max_ops)
                     .uri(format!("{}/classic/{:x}", socket, stream_event.machineHash))
                     .body(Body::from(stream_event.input.to_vec()))
                     .unwrap();
@@ -872,6 +878,7 @@ fn new_task_issued_handler(
     sockets_map: Arc<Mutex<HashMap<Vec<u8>, String>>>,
     config_socket: String,
     ruleset: String,
+    max_ops: u64,
     current_block_num: u64,
     secret_key: String,
     task_issuer: Address,
@@ -943,6 +950,7 @@ fn new_task_issued_handler(
                                     avs_registry_service.clone(),
                                     time_to_expiry,
                                     ruleset.clone(),
+                                    max_ops,
                                     current_block_num,
                                     quorum_nums.to_vec(),
                                     quorum_threshold_percentages.clone(),
